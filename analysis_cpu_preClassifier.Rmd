@@ -1,0 +1,625 @@
+---
+title: "Modelling CPU usage by combining a classification step and a regression step"
+author: "Álvaro Francesc Budría Fernández"
+output: pdf_document
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+## Introduction
+This document presents my analysis of a dataset containing data about a computer's usage. The final aim is to model the usage of a computer's CPU through a regression model. There are 8192 observations with 21 features plus a target.
+The approach taken here is to first classify observations as either active or inactive. Then inactive CPUs are predicted to have an activity of 0%, while the active CPUs activity is predicted with a regression model. Several models are compared through a 10fold CV procedure.
+
+```{r}
+library(MASS) # LDA, QDA
+library(class) # kNN
+library(TunePareto) # for generateCVRuns()
+library(glmnet) # ridge regression
+library(nnet) # MLP
+library(caret) # train MLPNN
+library(RSNNS)
+```
+
+
+## Read data
+```{r}
+X <- read.csv('cpu.csv')
+```
+
+
+
+## Check for missing values, anomalies, possible errors...
+```{r}
+sum(is.na(X))
+summary(X)
+rbind(apply(X, 2, mean), apply(X, 2, sd))
+# for (i in 1:22) # commented because output is huge
+  # boxplot(X[,i], main=colnames(X)[i])
+```
+No missing values codified as NA. There are no other common codifications for NAs, such as -1, -99... so we conclude that there are no missing data in the dataset.
+The boxplots allow us to detect many univariate outliers.
+
+
+We can see quite a lot of outliers for all the variables. If we look further into the observations that are showing an outlier for a particular variable, we can see that those observations are not necessarily outliers for other variables. Thus, it is not wise to remove observations with at least one outlier variable, as this would result in too many lost data.
+
+
+## Compute correlation between variables
+```{r}
+mosthighlycorrelated <- function(mydataframe,numtoreport)
+{
+  # find the correlations
+  cormatrix = cor(mydataframe)
+  # set the correlations on the diagonal or lower triangle to zero,
+  # so they will not be reported as the highest ones:
+  diag(cormatrix) = 0
+  cormatrix[lower.tri(cormatrix)] = 0
+  # flatten the matrix into a dataframe for easy sorting
+  fm = as.data.frame(as.table(cormatrix))
+  # assign human-friendly names
+  names(fm) = c("First.Variable", "Second.Variable","Correlation")
+  # sort and print the top n correlations
+  head(fm[order(abs(fm$Correlation),decreasing=TRUE),],n=numtoreport)
+}
+
+mosthighlycorrelated(X, 15)
+
+```
+
+
+
+We eliminate variables fork, pflt, ppgout, ppgin, pgscan, sread, as they are highly correlated with other variables, and therefore redundant.
+```{r}
+Xclean <- subset(X, select = -c(fork, pflt, ppgout, ppgin, pgscan, sread) )
+```
+
+
+
+
+## Split data into training (70%) and testing (30%) sets
+
+```{r}
+set.seed(12345)
+
+N <- nrow(X)
+train <- sample(1:N, round(2*N/3))
+ntrain <- length(train)
+ntest <- N - ntrain
+
+Xtrain <- Xclean[train,]
+Xtest <- Xclean[-train,]
+```
+
+
+
+There is something odd in the data. The dynamic range of the target usr seems to be split into two subintervals: one going from 0 to 4, the other from 4 to 100.
+Let's verify this hypothesis by running a multidimensional scaling on the data.
+
+Since computing the MDS for the whole dataset takes too long in a regular computer, we draw an iid sample with 20% of the data.
+```{r}
+set.seed(12345)
+
+sample <- Xclean[sample(nrow(Xclean),size=as.integer(0.2*nrow(X)),replace=FALSE),]
+distances <- dist(sample, method = "euclidean")
+matdist <- as.matrix(distances)
+matdist[1:5,1:5]
+```
+
+```{r}
+hist(matdist[lower.tri(matdist)])
+```
+
+
+Plot the coordinates in 2D space.
+```{r}
+mds.out <- cmdscale(matdist, eig=TRUE, k=2)
+  
+coords <- mds.out$points
+  
+plot(coords, asp=1, cex=0.25)
+```
+Indeed, there seem two be three differentiated groups.
+
+
+## Let's see if we can accurately differentiate between "active" and "non-active" CPUs
+
+We will try out several classification models:
+
+* Linear Discriminant Analysis (LDA)
+
+* Quadratic Discriminant Analysis (QDA)
+
+* kNN
+
+* Logistic regression
+
+* MLP neural netwrok
+
+```{r}
+Xcl <- Xtrain
+Xcl$active <- 0
+Xcl[Xcl[,"usr"] > 2,]$active <- 1
+Xcl <- Xcl[,-16]
+
+Xcl_test <- Xtest
+Xcl_test$active <- 0
+Xcl_test[Xcl_test[,"usr"] > 2,]$active <- 1
+Xcl_test <- Xcl_test[,-16]
+```
+
+
+```{r}
+cor(Xclean[,c(1:16)])[16,]
+```
+To classify, we use only the variables runqsz and freeswap, which have the highest correlation with our target.
+
+
+Scaled data for the LDA. By scaling the data, we ensure that both populations have the same variance and covariance, which is a condition for LDA.
+```{r}
+Xcl_sc <- as.data.frame(scale(Xtrain))
+Xcl_sc$usr <- Xtrain$usr
+Xcl_sc$active <- 0
+Xcl_sc[Xcl_sc[,"usr"] > 2,]$active <- 1
+Xcl_sc <- Xcl_sc[,-16]
+```
+
+
+kNN classifier function:
+```{r}
+# This function returns the error obtained with a kNN classifier with a certain
+# number of neighbours (myneighbours), for a certain data set (mydata, mytargets).
+loop.k <- function (mydata, mytargets, myneighbours)
+{
+  errors <- matrix (nrow=length(myneighbours), ncol=2)
+  colnames(errors) <- c("k","LOOCV error")
+
+  for (k in myneighbours)
+  {
+    myknn.cv <- knn.cv (mydata, mytargets, k = myneighbours[k])
+  
+    # fill in number of neighbours and LOOCV error
+    errors[k, "k"] <- myneighbours[k]
+  
+    tab <- table(Truth=mytargets, Preds=myknn.cv)
+    (errors[k, "LOOCV error"] <- 1 - sum(tab[row(tab)==col(tab)])/sum(tab))
+  }
+  errors
+}
+```
+
+Let's find the best k for kNN using only variables runqsz and freeswap:
+```{r}
+N <- nrow(Xcl)
+neighbours <- 1:10
+  
+#try without scaling data
+print(loop.k(Xcl[,c(13,15)], Xcl$active, neighbours))
+```
+```{r}
+#try scaling data
+print(loop.k(scale(Xcl[,c(13,15)]), Xcl$active, neighbours))
+```
+
+It looks like kNN is able to classify for any k.
+
+
+Are variables independent, given their class? 
+(This is the assumption behind the naïve Bayes):
+```{r}
+mosthighlycorrelated(Xcl[Xcl[,"active"] == 1,], 20)
+mosthighlycorrelated(Xcl[Xcl[,"active"] == 0,], 20)
+```
+No, they are not independent, therefore it does not make sense to run a Naïve Bayes classifier.
+
+
+Prepare data for the MLP classifier with a single hidden layer
+```{r}
+Xcl_nnet <- cbind(Xcl[,c(13,15)], as.factor(as.character(Xcl[,16])))
+colnames(Xcl_nnet)[3] <- "active"
+```
+
+```{r}
+Xcl_nnet_sc <- Xcl_nnet
+Xcl_nnet_sc[,c(1,2)] <- scale(Xcl_nnet_sc[,c(1,2)])
+```
+
+
+## Cross-Validation of LDA, QDA, kNN, Logistic Regression and MLP
+
+Candidates:
+
+* LDA with runqsz and freeswap as explanatory variables and scaled data
+
+* QDA with runqsz and freeswap as explanatory variables
+
+* kNN with runqsz and freeswap as explanatory variables and one neighbour
+
+* Logistic regression with runqsz and freeswap as explanatory variables
+
+* MLPNN with 5 hidden neurons.
+```{r}
+set.seed(12345)
+k <- 10
+CV.folds <- generateCVRuns (Xcl$active, ntimes=1, nfold=k, stratified=TRUE)
+
+cv.results <- matrix (rep(0,7*k),nrow=k)
+colnames (cv.results) <- c("k","fold","CV error|LDA","CV error|QDA","CV error|kNN",
+                           "CV error|logist", "CV error|nnet")
+
+cv.results[,"k"] <- k
+
+for (j in 1:k)
+{
+  # get TE data
+  te <- unlist(CV.folds[[1]][[j]])
+
+  #Data for nnet
+  Xcl_nnet_sc_tr <- Xcl_nnet[-te,]
+  Xcl_nnet_sc_te <- Xcl_nnet[te,]
+
+  # train on TR data
+  my_lda <- lda(active~. , data=Xcl_sc[-te,c(13,15,16)])
+  my_qda <- qda(active~. , data=Xcl[-te, c(13,15,16)])
+  my_logist <- glm(active~. , data=Xcl[-te, c(13,15,16)], family=binomial)
+  my_nnet  <- nnet(active ~. , data = Xcl_nnet_sc_tr, size = 5, trace=F)
+  
+  
+  # predict on TE data
+  pred_lda <- predict(my_lda, Xcl_sc[te, c(13,15)])
+  pred_qda <- predict(my_qda, Xcl[te, c(13,15)])
+  pred_knn <- knn(Xcl[-te, c(13,15)], Xcl[te, c(13,15)], cl=Xcl[-te,]$active, k=1)
+  pred_logist <- predict(my_logist, Xcl[te, c(13,15)], ty="response")
+  pred_nnet  <- round(predict(my_nnet, Xcl_nnet_sc_te[,c(1,2)]))
+
+  # record validation error for this fold
+  ct_lda <- table(Truth=Xcl_sc[te,]$active, Pred=pred_lda$class)
+  cv.results[j,"CV error|LDA"] <- 1-sum(diag(ct_lda))/sum(ct_lda)
+  
+  ct_qda <- table(Truth=Xcl[te,]$active, Pred=pred_qda$class)
+  cv.results[j,"CV error|QDA"] <- (1-sum(diag(ct_qda))/sum(ct_qda))
+  
+  ct_knn <- table(Truth=Xcl[te,]$active, Pred=pred_knn)
+  cv.results[j,"CV error|kNN"] <- 1-sum(diag(ct_knn))/sum(ct_knn)
+  
+  ct_logist <- table(truth=Xcl[te,]$active, Pred=round(pred_logist))
+  cv.results[j,"CV error|logist"] <- 1-sum(diag(ct_logist))/sum(ct_logist)
+  
+  ct_nnet <- table(truth=as.numeric(as.character(Xcl_nnet_sc_te$active)), Pred=pred_nnet)
+  cv.results[j, "CV error|nnet"] <- 1-sum(diag(ct_nnet))/sum(ct_nnet)
+
+  
+  cv.results[j,"fold"] <- j
+}
+(colMeans(cv.results[,c("CV error|LDA", "CV error|QDA", "CV error|kNN",
+                        "CV error|logist", "CV error|nnet")]))
+```
+This is an easy classification problem, and several models obtain 0 CV error.
+
+
+## Computation of Testing Error for the Chosen Classifiers
+
+### QDA
+```{r}
+my_qda <- qda(active~. , data=Xcl[, c(13,15,16)])
+pred_qda <- predict(my_qda, Xcl_test[, c(13,15,16)], ty="response")
+
+(ct_qda <- table(Truth=Xcl_test$active, Pred=pred_qda$class))
+(Mp <- 1-sum(diag(ct_qda))/sum(ct_qda))
+```
+
+
+
+### kNN
+```{r}
+pred_knn <- knn(Xcl[, c(13,15)], Xcl_test[, c(13,15)], cl=Xcl$active, k=1)
+
+
+ct_knn <- table(Truth=Xcl_test$active, Pred=pred_knn)
+(Mp <- 1-sum(diag(ct_knn))/sum(ct_knn))
+```
+
+
+
+### Logistic regression
+```{r}
+my_logist <- glm(active~ ., data=Xcl[, c(13,15,16)], family=binomial)
+pred_logist <- predict(my_logist, Xcl_test[, c(13,15,16)], ty="response")
+
+(ct_logist <- table(truth=Xcl_test$active, pred=round(pred_logist)))
+(Mp <- 1-sum(diag(ct_logist))/sum(ct_logist))
+```
+
+
+Since we classify cpu's as "active" or "inactive", we have to adjust a regression only on the active ones, and assume that inactive cpu's have a 'usr' equal to 0.
+```{r}
+Xcpu <- Xtrain[Xtrain[,"usr"]>2,]
+Xno_cpu <- Xtrain[Xtrain[,"usr"]<=2,]
+```
+
+
+
+
+## Let's adjust some regression models
+
+We can obtain a reduced formula, that is, select some of the features, with the `step()` function.
+
+```{r}
+# Apply step() on binomial(logit)
+mod_logit <- glm(usr/100~. , family=binomial(link=logit), data=Xcpu)
+
+suppressWarnings(form_logit <- step(mod_logit, trace=FALSE)$formula)
+```
+
+```{r}
+# Apply step() on binomial(probit)
+mod_probit <- glm(usr/100~. , family=binomial(link=probit), data=Xcpu)
+
+suppressWarnings(form_probit <- step(mod_probit, trace=FALSE)$formula)
+```
+
+```{r}
+# Apply step() on binomial(cloglog)
+mod_cloglog <- glm(usr/100~. , family=binomial(link=cloglog), data=Xcpu)
+
+suppressWarnings(form_cloglog <- step(mod_cloglog, trace=FALSE)$formula)
+```
+
+
+## Cross-Validation to Choose the Binomials's Link Function
+```{r}
+set.seed(12345)
+k <- 10
+CV.folds <- generateCVRuns (Xcpu$usr, ntimes=1, nfold=k, stratified=TRUE)
+
+cv.results <- matrix (rep(0,5*k),nrow=k)
+colnames (cv.results) <- c("k","fold", "CV error|logit",
+                           "CV error|probit", "CV error|cloglog")
+cv.results[,"CV error|logit"] <- 0
+cv.results[,"CV error|probit"] <- 0
+cv.results[,"CV error|cloglog"] <- 0
+cv.results[,"k"] <- k
+
+
+for (j in 1:k)
+{
+  # get TE data
+  te <- unlist(CV.folds[[1]][[j]])
+
+  # train on TR data
+  mod_logit <- glm(form_logit , family=binomial(link=logit), data=Xcpu[-te,])
+  mod_probit <- glm(form_probit , family=binomial(link=probit), data=Xcpu[-te,])
+  mod_cloglog <- glm(form_cloglog , family=binomial(link=cloglog), data=Xcpu[-te,])
+
+  
+  # predict TE data
+  pred_logit <- predict(mod_logit, newdata=Xcpu[te,-16], ty="response")
+  pred_probit <- predict(mod_probit, newdata=Xcpu[te,-16], ty="response")
+  pred_cloglog <- predict(mod_cloglog, newdata=Xcpu[te,-16], ty="response")
+
+
+  # record validation error for this fold
+  n <- nrow(Xcpu[te,])
+  cv.results[j,"CV error|logit"] <- sum((Xcpu[te,]$usr-pred_logit*100)^2) / n
+  cv.results[j,"CV error|probit"] <- sum((Xcpu[te,]$usr-pred_probit*100)^2) / n
+  cv.results[j,"CV error|cloglog"] <- sum((Xcpu[te,]$usr-pred_cloglog*100)^2) / n
+  
+  cv.results[j,"fold"] <- j
+}
+colMeans(cv.results[, 3:5])
+```
+Choose cloglog as the link function for the binomial regression
+
+
+Linear model:
+```{r}
+# Apply step() on lm
+mod <- glm(usr/100~. , data=Xcpu)
+
+suppressWarnings(form <- step(mod, trace=FALSE)$formula)
+```
+
+
+Regression without classifier:
+```{r}
+# lm (Gaussian family and identity link)
+mod_noCl <- glm(usr/100~. , data=Xtrain)
+suppressWarnings(form_noCL <- step(mod_noCl, trace=FALSE)$formula)
+
+# glm (Binomial family and cloglog link)
+mod_cloglog_noCl <- glm(usr/100~. , family=binomial(link=cloglog), data=Xtrain)
+suppressWarnings(form_cloglog_noCl <- step(mod_cloglog_noCl, trace=FALSE)$formula)
+```
+
+
+Ridge regression with classifier:
+```{r}
+set.seed(12345)
+# reference: https://www.datacamp.com/community/tutorials/tutorial-ridge-lasso-elastic-net
+#X will be standardized in the modelling function
+# Setting alpha = 0 implements ridge regression
+ridge_cv <- cv.glmnet(as.matrix(Xcpu[,-16]), Xcpu[,16], alpha=0,
+                      standardize=TRUE, nfolds=10)
+
+#get best lambda
+(lambda_cv <- ridge_cv$lambda.min)
+
+#We are going to scale training and testing data separately,
+# because we don't want training data to influence testing data
+# (recall that when scaling we substract the mean and divide by the std).
+```
+
+
+LASSO regression:
+```{r}
+Xfull <- X
+Xfull_tr <- Xfull[train,]
+Xfull_tr_cpu <- Xfull_tr[Xfull_tr$usr > 2,]
+
+# Setting alpha = 1 implements LASSO regression
+lasso_cv <- cv.glmnet(as.matrix(Xfull_tr_cpu[,-22]), Xfull_tr_cpu[,22], alpha=1,
+                      standardize=TRUE, nfolds=10)
+
+#get best mu
+(mu_cv <- lasso_cv$lambda.min)
+```
+
+
+
+RBF Neural Network:
+```{r}
+M <- floor(nrow(Xcpu)^(1/3)) # Number of centroids for the RBFNN
+```
+
+
+
+## Cross-Validation of:
+
+* with classifier: Binomial, Normal, Ridge, Null model (predicts the average), MLPNN, LASSO and RBFNN
+
+* withot classifier: Normal and Binomial
+```{r}
+set.seed(12345)
+k <- 10
+CV.folds <- generateCVRuns(Xtrain$usr, ntimes=1, nfold=k)
+
+cv.results <- matrix (rep(0,11*k),nrow=k)
+colnames (cv.results) <- c("k","fold", "CV error|Bin", "CV error|Normal",
+                           "CV error|NormalnoCl", "CV error|BinnoCl",
+                           "CV error|Ridge", "CV error|Nul", "CV error|LASSO",
+                           "CV error|nnet", "CV error|rbf")
+cv.results[,"CV error|Bin"] <- 0
+cv.results[,"CV error|NormalnoCl"] <- 0
+cv.results[,"CV error|BinnoCl"] <- 0
+cv.results[,"CV error|Ridge"] <- 0
+cv.results[,"CV error|Nul"] <- 0
+cv.results[,"CV error|LASSO"] <- 0
+cv.results[,"CV error|nnet"] <- 0
+cv.results[,"CV error|rbf"] <- 0
+cv.results[,"k"] <- k
+
+
+for (j in 1:k)
+{
+  # get TE data
+  te <- unlist(CV.folds[[1]][[j]])
+  
+  Xtr <- Xtrain[-te,]
+  Xtr_cpu <- Xtr[Xtr$usr > 2,]
+  Xtr_no_cpu <- Xtr[Xtr$usr <= 2,]
+  
+  Xte <- Xtrain[te,]
+  Xte_cpu <- Xte[Xte$usr > 2,]
+  Xte_no_cpu <- Xte[Xte$usr <= 2,]
+  
+  # Data for LASSO
+  Xf_tr <- Xfull_tr[-te,]
+  Xf_tr_cpu <- Xf_tr[Xf_tr$usr > 2,]
+  Xf_tr_no_cpu <- Xf_tr[Xf_tr$usr <= 2,]
+  
+  Xf_te <- Xfull_tr[te,]
+  Xf_te_cpu <- Xf_te[Xf_te$usr > 2,]
+  Xf_te_no_cpu <- Xf_te[Xf_te$usr <= 2,]
+  
+  # Data for MLPNN
+  Xtr_cpu_sc <- Xtr_cpu
+  Xtr_cpu_sc[,-16] <- scale(Xtr_cpu_sc[,-16])
+
+  Xte_cpu_sc <- Xte_cpu
+  Xte_cpu_sc[,-16] <- scale(Xte_cpu_sc[,-16])
+  
+  
+  # train on TR data
+  mod_cloglog <- glm(form_cloglog, family=binomial(link=cloglog), data=Xtr_cpu)
+  mod <- glm(form , data=Xtr_cpu)
+  mod_noCl <- glm(form_noCL ,data=Xtr)
+  mod_cloglog_noCl <- glm(form_cloglog_noCl, family=binomial(link=cloglog), data=Xtr)
+  ridge <- glmnet(as.matrix(Xtr_cpu[,-16]), Xtr_cpu$usr, alpha = 0,
+                  lambda = lambda_cv, standardize = TRUE)
+  m0 <- lm(usr ~ 1, data = Xtr_cpu)
+  lasso <- glmnet(as.matrix(Xf_tr_cpu[,-22]), Xf_tr_cpu$usr, alpha = 1,
+                  lambda = mu_cv, standardize = TRUE)
+  my_nnet  <- nnet(usr ~. , data = Xtr_cpu_sc, size = 13, trace=F, linout=TRUE,
+                   maxit = 500, skip=TRUE)
+  my_rbf <- rbf(Xtr_cpu_sc[,-16], Xtr_cpu_sc[,16], size=c(M), maxit=100,
+                initFunc="RBF_Weights", linOut=TRUE)
+
+  # predict TE data
+  pred_cloglog <- predict(mod_cloglog, newdata=Xte_cpu[,-16], ty="response")
+  pred <- predict(mod, newdata=Xte_cpu[,-16], ty="response")
+  pred_noCl <- predict(mod, newdata=Xte[,-16], ty="response")
+  pred_cloglog_noCl <- predict(mod_cloglog_noCl, newdata=Xte[,-16], ty="response")
+  y_ridge <- predict(ridge, as.matrix(Xte_cpu[,-16]), ty="response")
+  mean <- m0$coefficients
+  y_lasso <- predict(lasso, as.matrix(Xf_te_cpu[,-22]), ty="response")
+  pred_nnet  <- predict(my_nnet, Xte_cpu_sc)
+  pred_rbf  <- predict(my_rbf, Xte_cpu[,-16])
+  
+  # record validation error for this fold
+  cv.results[j,"CV error|Bin"] <- (sum((Xte_cpu$usr-pred_cloglog*100)^2)
+                                   + sum((Xte_no_cpu$usr-0)^2)) / nrow(Xte)
+  cv.results[j,"CV error|Normal"] <- (sum((Xte_cpu$usr-pred*100)^2)
+                                      + sum((Xte_no_cpu$usr-0)^2)) / nrow(Xte)
+  cv.results[j,"CV error|NormalnoCl"] <- sum((Xte$usr-pred_noCl*100)^2) / nrow(Xte)
+  cv.results[j,"CV error|BinnoCl"] <- sum((Xte$usr-pred_cloglog_noCl*100)^2) / nrow(Xte)
+  cv.results[j,"CV error|Ridge"] <- (t(Xte_cpu$usr - y_ridge) %*% (Xte_cpu$usr - y_ridge)
+                                     + sum((Xte_no_cpu$usr-0)^2)) / nrow(Xte)
+  cv.results[j,"CV error|Nul"] <- (sum((Xte_cpu$usr-mean)^2)
+                                   + sum((Xte_no_cpu$usr-0)^2)) / nrow(Xte)
+  cv.results[j,"CV error|LASSO"] <- ((t(Xf_te_cpu$usr - y_lasso) %*% (Xf_te_cpu$usr - y_lasso))
+                                     + sum((Xf_te_no_cpu$usr-0)^2)) / nrow(Xte)
+  cv.results[j,"CV error|nnet"] <- (sum((Xte_cpu_sc$usr-pred_nnet)^2)
+                                    + sum((Xte_no_cpu$usr-0)^2)) / nrow(Xte)
+  cv.results[j,"CV error|rbf"] <- (sum((Xte_cpu[,16] - pred_rbf)^2)
+                                   + sum((Xte_no_cpu$usr-0)^2))/(nrow(Xte_cpu))
+  
+  cv.results[j,"fold"] <- j
+}
+colMeans(cv.results[, 3:11])
+```
+
+The model with the lowest CV error is the LASSO, followed by the ridge regression. It seems that regularization pays off in this scenario.
+
+
+## Compute Testing Error and Confidence Interval
+The final model is the LASSO. Let's train it on the whole training dataset and compute its testing error.
+
+### Compute Testing Error
+
+```{r}
+Xfull <- X
+
+Xfull_tr <- Xfull[train,]
+Xfull_tr_cpu <- Xfull_tr[Xfull_tr$usr > 2,]
+
+Xfull_te <- Xfull[-train,]
+Xfull_te_cpu <- Xfull_te[Xfull_te$usr > 2,]
+Xfull_te_no_cpu <- Xfull_te[Xfull_te$usr <= 2,]
+
+# Setting alpha = 1 implements LASSO regression
+my_lasso <- glmnet(as.matrix(Xfull_tr_cpu[,-22]), Xfull_tr_cpu$usr, alpha = 1,
+                   lambda = mu_cv, standardize = TRUE)
+y_lasso <- predict(my_lasso, as.matrix(Xfull_te_cpu[,-22]), ty="response")
+
+Mp <- ((t(Xfull_te_cpu$usr-y_lasso) %*% (Xfull_te_cpu$usr-y_lasso))
+       + sum((Xfull_te_no_cpu$usr-0)^2))
+
+N <- nrow(Xfull_te)
+(NRMSE <- sqrt(Mp / ((N-1)*var(Xfull_te$usr))))
+(R2 <- 1-NRMSE^2) # R^2
+```
+We have obtained an accuracy of 98.18%, 2% higher than when using PCA without a previous classifier!
+
+## Confidence Interval for the Determination Coefficient ${R^2}$
+Source: https://stats.stackexchange.com/questions/175026/formula-for-95-confidence-interval-for-r2
+Signification level: 5%
+```{r}
+k <- sum(my_lasso$beta > 1e-9 | my_lasso$beta < -1e-9) #number of predictors of our model
+
+SE <- sqrt( (4*R2*(1-R2)^2*(N-k-1)^2) / ((N^2-1)*(3+N)) )
+
+
+c(R2-2*SE, R2+2*SE)
+```
+
+By splitting the initial dataset into two separate groups, we have managed to obtain a 2% increase in accuracy in the final regression, at the cost of higher model complexity.
